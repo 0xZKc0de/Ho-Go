@@ -27,9 +27,19 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// getEnv returns the environment variable value or a default.
+func getEnv(key, fallback string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
+	return fallback
+}
+
 func main() {
-	serverURL := flag.String("server", "ws://localhost:8080/ws", "CipherRelay server WebSocket URL")
-	forwardURL := flag.String("forward", "http://localhost:3000", "local target URL to forward decrypted webhooks to")
+	serverURL := flag.String("server", getEnv("CR_SERVER", "ws://localhost:8080/ws"), "CipherRelay server WebSocket URL")
+	forwardURL := flag.String("forward", getEnv("CR_FORWARD", "http://localhost:3000"), "local target URL to forward decrypted webhooks to")
+	authToken := flag.String("auth-token", getEnv("CR_AUTH_TOKEN", ""), "authentication token if required by server")
+	requestedID := flag.String("id", getEnv("CR_TUNNEL_ID", ""), "request a specific static tunnel ID (e.g. 'my-dev-env')")
 	flag.Parse()
 
 	// Step 1: Generate RSA-2048 key pair.
@@ -49,9 +59,11 @@ func main() {
 	defer conn.Close()
 	log.Println("[client] connected to server")
 
-	// Step 3: Send public key for tunnel registration.
+	// Step 3: Send public key and optional configs for tunnel registration.
 	reg := models.ClientRegistration{
 		PublicKeyPEM: string(pubKeyPEM),
+		AuthToken:    *authToken,
+		RequestedID:  *requestedID,
 	}
 	regJSON, err := json.Marshal(reg)
 	if err != nil {
@@ -153,30 +165,44 @@ func main() {
 
 // forwardWebhook sends the decrypted webhook data as an HTTP request
 // to the local target service, preserving the original method, headers, and body.
+// It uses exponential backoff to retry if the local service is temporarily down.
 func forwardWebhook(client *http.Client, targetURL string, data *models.WebhookData) {
-	req, err := http.NewRequest(data.Method, targetURL, bytes.NewReader(data.Body))
-	if err != nil {
-		log.Printf("[forward] create request error: %v", err)
-		return
-	}
+	maxRetries := 5
+	backoff := 500 * time.Millisecond
 
-	// Restore original headers.
-	for key, values := range data.Headers {
-		for _, v := range values {
-			req.Header.Add(key, v)
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		req, err := http.NewRequest(data.Method, targetURL, bytes.NewReader(data.Body))
+		if err != nil {
+			log.Printf("[forward] create request error: %v", err)
+			return
+		}
+
+		// Restore original headers.
+		for key, values := range data.Headers {
+			for _, v := range values {
+				req.Header.Add(key, v)
+			}
+		}
+
+		resp, err := client.Do(req)
+		
+		// Success
+		if err == nil {
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			log.Printf("[forward] → %s %s → %d (%d bytes response)",
+				data.Method, targetURL, resp.StatusCode, len(body))
+			return
+		}
+
+		// Failure - retry logic
+		log.Printf("[forward] error on attempt %d/%d: %v", attempt, maxRetries, err)
+		if attempt < maxRetries {
+			log.Printf("[forward] retrying in %v...", backoff)
+			time.Sleep(backoff)
+			backoff *= 2 // Exponential backoff
 		}
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("[forward] request error: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	// Read and discard the response body.
-	body, _ := io.ReadAll(resp.Body)
-
-	log.Printf("[forward] → %s %s → %d (%d bytes response)",
-		data.Method, targetURL, resp.StatusCode, len(body))
+	log.Printf("[forward] ❌ failed to forward webhook after %d attempts", maxRetries)
 }

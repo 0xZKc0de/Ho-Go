@@ -7,7 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/hex"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -42,12 +42,14 @@ type TunnelClient struct {
 type Hub struct {
 	mu      sync.RWMutex
 	clients map[string]*TunnelClient
+	logger  *slog.Logger
 }
 
 // NewHub creates and returns a new Hub with an initialized client map.
-func NewHub() *Hub {
+func NewHub(logger *slog.Logger) *Hub {
 	return &Hub{
 		clients: make(map[string]*TunnelClient),
+		logger:  logger,
 	}
 }
 
@@ -56,7 +58,7 @@ func (h *Hub) Register(client *TunnelClient) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.clients[client.ID] = client
-	log.Printf("[hub] registered tunnel: %s (active: %d)", client.ID, len(h.clients))
+	h.logger.Info("registered tunnel", "tunnel_id", client.ID, "active", len(h.clients))
 }
 
 // Unregister removes a tunnel client from the hub and closes its
@@ -73,7 +75,7 @@ func (h *Hub) Unregister(tunnelID string) {
 	close(client.Send)
 	client.Conn.Close()
 	delete(h.clients, tunnelID)
-	log.Printf("[hub] unregistered tunnel: %s (active: %d)", tunnelID, len(h.clients))
+	h.logger.Info("unregistered tunnel", "tunnel_id", tunnelID, "active", len(h.clients))
 }
 
 // GetClient returns the TunnelClient for the given tunnel ID,
@@ -114,12 +116,14 @@ func (c *TunnelClient) WritePump() {
 				return
 			}
 			if err := c.Conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-				log.Printf("[hub] write error for tunnel %s: %v", c.ID, err)
+				// Don't log if the error is just a broken pipe when the client disconnects
+				if !websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+					// Silent
+				}
 				return
 			}
 		case <-ticker.C:
 			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				log.Printf("[hub] ping error for tunnel %s: %v", c.ID, err)
 				return
 			}
 		}
@@ -142,7 +146,7 @@ func (c *TunnelClient) ReadPump(hub *Hub) {
 	for {
 		if _, _, err := c.Conn.ReadMessage(); err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-				log.Printf("[hub] read error for tunnel %s: %v", c.ID, err)
+				hub.logger.Error("read error", "tunnel_id", c.ID, "err", err)
 			}
 			return
 		}

@@ -2,7 +2,7 @@
 
 **End-to-End Encrypted Webhook Forwarding Tunnel**
 
-CipherRelay is a secure webhook forwarding tunnel built in Go. It uses hybrid encryption (RSA-2048 + AES-256-GCM) to ensure that webhook payloads are encrypted end-to-end — the relay server **never** sees plaintext data.
+CipherRelay is a secure, production-ready webhook forwarding tunnel built in Go. It uses hybrid encryption (RSA-2048 + AES-256-GCM) to ensure that webhook payloads are encrypted end-to-end — the relay server **never** sees plaintext data.
 
 > A privacy-first alternative to ngrok for webhook development.
 
@@ -48,27 +48,14 @@ The server **never** has access to the private key — it can only encrypt, neve
 
 ---
 
-## Project Structure
+## Production Features
 
-```
-├── cmd/
-│   ├── server/main.go      # Server entrypoint
-│   └── client/main.go      # Client entrypoint
-├── server/
-│   ├── hub.go               # WebSocket hub & tunnel registry
-│   └── handlers.go          # HTTP handlers (WS upgrade + webhook ingress)
-├── internal/
-│   ├── crypto/crypto.go     # Hybrid RSA + AES-GCM encryption
-│   └── models/models.go     # Shared data types
-├── go.mod
-└── go.sum
-```
-
----
-
-## Prerequisites
-
-- **Go 1.21+** (tested with Go 1.25)
+- **Authentication**: Secure your server with pre-shared tokens so only authorized clients can connect.
+- **Static Tunnel IDs**: Request custom, predictable tunnel URLs (e.g., `my-stripe-env`) instead of random hex strings.
+- **Client Retries**: Exponential backoff retry mechanism ensures webhooks aren't lost if your local app is briefly down or restarting.
+- **Structured Logging**: JSON logging via `log/slog` on the server for easy integration with Datadog, ELK, etc.
+- **TLS Support**: Run the server securely with standard TLS certificates (`wss://` and `https://`).
+- **12-Factor Ready**: Configure via CLI flags or Environment Variables.
 
 ---
 
@@ -84,77 +71,54 @@ go mod tidy
 
 ### 2. Start the server (Terminal 1)
 
-Keep this running!
+Keep this running! You can secure it by passing an auth token:
 ```bash
-go run ./cmd/server -addr :8080 -base-url http://localhost:8080
+go run ./cmd/server -addr :8080 -base-url http://localhost:8080 -auth-tokens "my-secret-token"
 ```
 
 ### 3. Start the client (Terminal 2)
 
-Keep this running! It will connect to the server.
+Keep this running! It will connect to the server. Here we request a static ID (`my-dev-env`) and pass the auth token:
 ```bash
-go run ./cmd/client -server ws://localhost:8080/ws -forward http://localhost:3000
-```
-
-The client will display:
-
-```
-╔══════════════════════════════════════════════════════════════╗
-║                   CipherRelay Tunnel Active                 ║
-╠══════════════════════════════════════════════════════════════╣
-║  Tunnel ID:   <your-tunnel-id>
-║  Webhook URL: http://localhost:8080/hook/<your-tunnel-id>
-║  Forwarding:  http://localhost:3000
-╠══════════════════════════════════════════════════════════════╣
-║  Encryption:  RSA-2048 + AES-256-GCM (Hybrid E2EE)         ║
-║  Status:      Listening for encrypted payloads...           ║
-╚══════════════════════════════════════════════════════════════╝
+go run ./cmd/client -server ws://localhost:8080/ws -forward http://localhost:3000 -auth-token "my-secret-token" -id "my-dev-env"
 ```
 
 ### 4. Send a test webhook (Terminal 3)
 
-Copy the `Tunnel ID` from Terminal 2 and replace `<your-tunnel-id>` below:
+Because we requested a static ID, the URL is predictable:
 ```bash
 curl -X POST \
   -H "Content-Type: application/json" \
   -d '{"event":"payment.completed","amount":4200}' \
-  http://localhost:8080/hook/<your-tunnel-id>
+  http://localhost:8080/hook/my-dev-env
 ```
 
-The payload will be encrypted by the server, sent over WebSocket, decrypted by the client, and forwarded to `http://localhost:3000` with the original method, headers, and body preserved.
+The payload will be encrypted by the server, sent over WebSocket, decrypted by the client, and forwarded to `http://localhost:3000`. If localhost is down, the client will retry up to 5 times.
 
 ---
 
-## CLI Reference
+## Configuration Reference
+
+Both Server and Client can be configured via Environment Variables or CLI flags. Flags take precedence over environment variables.
 
 ### Server
 
-```
-go run ./cmd/server [flags]
-
-Flags:
-  -addr       string   Server listen address (default ":8080")
-  -base-url   string   Public base URL for webhook endpoints (default "http://localhost:8080")
-```
+| CLI Flag | Environment Variable | Default | Description |
+|----------|----------------------|---------|-------------|
+| `-addr` | `CR_ADDR` | `:8080` | Listen address |
+| `-base-url` | `CR_BASE_URL` | `http://localhost:8080` | Public base URL for webhooks |
+| `-auth-tokens` | `CR_AUTH_TOKENS` | *(empty)* | Comma-separated list of valid tokens (empty disables auth) |
+| `-cert` | `CR_CERT` | *(empty)* | TLS certificate file path |
+| `-key` | `CR_KEY` | *(empty)* | TLS key file path |
 
 ### Client
 
-```
-go run ./cmd/client [flags]
-
-Flags:
-  -server     string   CipherRelay server WebSocket URL (default "ws://localhost:8080/ws")
-  -forward    string   Local target URL to forward decrypted webhooks (default "http://localhost:3000")
-```
-
----
-
-## Dependencies
-
-| Package | Version | Purpose |
-|---------|---------|---------|
-| `github.com/gorilla/websocket` | v1.5.3 | WebSocket client/server |
-| Go stdlib `crypto/*` | — | RSA-OAEP, AES-GCM, key generation |
+| CLI Flag | Environment Variable | Default | Description |
+|----------|----------------------|---------|-------------|
+| `-server` | `CR_SERVER` | `ws://localhost:8080/ws` | Server WebSocket URL |
+| `-forward` | `CR_FORWARD` | `http://localhost:3000` | Local target URL to forward to |
+| `-auth-token` | `CR_AUTH_TOKEN` | *(empty)* | Token to authenticate with server |
+| `-id` | `CR_TUNNEL_ID` | *(empty)* | Request a specific static tunnel ID |
 
 ---
 

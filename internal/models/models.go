@@ -29,9 +29,12 @@ type EncryptedPayload struct {
 
 // ClientRegistration is the initial message sent by the client to the
 // server over WebSocket to register a new tunnel. It contains the
-// client's RSA public key in PEM-encoded format.
+// client's RSA public key in PEM-encoded format, and optionally an
+// auth token and a requested static tunnel ID.
 type ClientRegistration struct {
 	PublicKeyPEM string `json:"public_key_pem"`
+	AuthToken    string `json:"auth_token,omitempty"`
+	RequestedID  string `json:"requested_id,omitempty"`
 }
 
 // RegistrationResponse is sent by the server back to the client after

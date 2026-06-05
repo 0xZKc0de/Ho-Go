@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -22,49 +22,70 @@ var upgrader = websocket.Upgrader{
 // HandleWebSocket returns an HTTP handler that upgrades incoming connections
 // to WebSocket, reads the client's RSA public key, registers a new tunnel,
 // and sends back the tunnel ID and public webhook URL.
-//
-// Protocol:
-//  1. Client connects via WebSocket.
-//  2. Client sends a JSON ClientRegistration message with its PEM-encoded public key.
-//  3. Server registers the tunnel and responds with a JSON RegistrationResponse.
-//  4. Server starts read/write pumps for the connection lifecycle.
-func HandleWebSocket(hub *Hub, baseURL string) http.HandlerFunc {
+func HandleWebSocket(hub *Hub, baseURL string, validTokens map[string]bool, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			log.Printf("[ws] upgrade error: %v", err)
+			logger.Error("ws upgrade error", "err", err)
 			return
 		}
 
-		// Step 1: Read client registration (public key).
+		// Step 1: Read client registration (public key + optional auth/static ID).
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
-			log.Printf("[ws] read registration error: %v", err)
+			logger.Error("read registration error", "err", err)
 			conn.Close()
 			return
 		}
 
 		var reg models.ClientRegistration
 		if err := json.Unmarshal(msg, &reg); err != nil {
-			log.Printf("[ws] invalid registration JSON: %v", err)
+			logger.Error("invalid registration JSON", "err", err)
 			conn.Close()
 			return
 		}
 
-		// Step 2: Parse the RSA public key from PEM.
+		// Step 2: Validate Authentication (if enabled).
+		if validTokens != nil {
+			if reg.AuthToken == "" || !validTokens[reg.AuthToken] {
+				logger.Warn("authentication failed", "remote_addr", r.RemoteAddr)
+				conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "invalid auth token"))
+				conn.Close()
+				return
+			}
+		}
+
+		// Step 3: Parse the RSA public key from PEM.
 		pubKey, err := crypto.ParsePublicKeyPEM([]byte(reg.PublicKeyPEM))
 		if err != nil {
-			log.Printf("[ws] invalid public key: %v", err)
+			logger.Error("invalid public key", "err", err)
 			conn.Close()
 			return
 		}
 
-		// Step 3: Generate tunnel ID and register the client.
-		tunnelID, err := GenerateTunnelID()
-		if err != nil {
-			log.Printf("[ws] generate tunnel ID error: %v", err)
-			conn.Close()
-			return
+		// Step 4: Determine Tunnel ID.
+		var tunnelID string
+		if reg.RequestedID != "" {
+			// Basic sanitization: alphanumeric and hyphens only
+			tunnelID = strings.TrimSpace(reg.RequestedID)
+			if len(tunnelID) > 64 {
+				tunnelID = tunnelID[:64]
+			}
+			
+			// Check if already in use
+			if hub.GetClient(tunnelID) != nil {
+				logger.Warn("requested tunnel ID already in use", "tunnel_id", tunnelID)
+				conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "tunnel ID already in use"))
+				conn.Close()
+				return
+			}
+		} else {
+			tunnelID, err = GenerateTunnelID()
+			if err != nil {
+				logger.Error("generate tunnel ID error", "err", err)
+				conn.Close()
+				return
+			}
 		}
 
 		client := &TunnelClient{
@@ -75,7 +96,7 @@ func HandleWebSocket(hub *Hub, baseURL string) http.HandlerFunc {
 		}
 		hub.Register(client)
 
-		// Step 4: Send registration response with tunnel ID and webhook URL.
+		// Step 5: Send registration response with tunnel ID and webhook URL.
 		webhookURL := fmt.Sprintf("%s/hook/%s", strings.TrimRight(baseURL, "/"), tunnelID)
 		resp := models.RegistrationResponse{
 			TunnelID:   tunnelID,
@@ -84,20 +105,20 @@ func HandleWebSocket(hub *Hub, baseURL string) http.HandlerFunc {
 
 		respJSON, err := json.Marshal(resp)
 		if err != nil {
-			log.Printf("[ws] marshal response error: %v", err)
+			logger.Error("marshal response error", "err", err)
 			hub.Unregister(tunnelID)
 			return
 		}
 
 		if err := conn.WriteMessage(websocket.TextMessage, respJSON); err != nil {
-			log.Printf("[ws] write response error: %v", err)
+			logger.Error("write response error", "err", err)
 			hub.Unregister(tunnelID)
 			return
 		}
 
-		log.Printf("[ws] tunnel active: %s → %s", tunnelID, webhookURL)
+		logger.Info("tunnel ready", "tunnel_id", tunnelID, "webhook_url", webhookURL)
 
-		// Step 5: Start connection lifecycle goroutines.
+		// Step 6: Start connection lifecycle goroutines.
 		go client.WritePump()
 		go client.ReadPump(hub)
 	}
@@ -107,9 +128,7 @@ func HandleWebSocket(hub *Hub, baseURL string) http.HandlerFunc {
 // requests for a specific tunnel ID. It reads the full request (method,
 // headers, body), encrypts it using the client's RSA public key via
 // hybrid encryption, and forwards the encrypted payload over WebSocket.
-//
-// URL pattern: /hook/{tunnelID}
-func HandleWebhook(hub *Hub) http.HandlerFunc {
+func HandleWebhook(hub *Hub, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Extract tunnel ID from URL path: /hook/{tunnelID}
 		tunnelID := strings.TrimPrefix(r.URL.Path, "/hook/")
@@ -145,14 +164,15 @@ func HandleWebhook(hub *Hub) http.HandlerFunc {
 		// Serialize the webhook data to JSON for encryption.
 		plaintext, err := json.Marshal(webhookData)
 		if err != nil {
-			http.Error(w, `{"error":"failed to serialize webhook data"}`, http.StatusInternalServerError)
+			logger.Error("failed to serialize webhook data", "err", err)
+			http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
 			return
 		}
 
 		// Encrypt using hybrid encryption (RSA + AES-GCM).
 		encPayload, err := crypto.EncryptPayload(client.PublicKey, plaintext)
 		if err != nil {
-			log.Printf("[webhook] encryption error for tunnel %s: %v", tunnelID, err)
+			logger.Error("encryption error", "tunnel_id", tunnelID, "err", err)
 			http.Error(w, `{"error":"encryption failed"}`, http.StatusInternalServerError)
 			return
 		}
@@ -160,16 +180,17 @@ func HandleWebhook(hub *Hub) http.HandlerFunc {
 		// Serialize the encrypted payload and send it to the client.
 		encJSON, err := json.Marshal(encPayload)
 		if err != nil {
-			http.Error(w, `{"error":"failed to serialize encrypted payload"}`, http.StatusInternalServerError)
+			logger.Error("failed to serialize encrypted payload", "err", err)
+			http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
 			return
 		}
 
 		// Non-blocking send to avoid blocking the webhook response.
 		select {
 		case client.Send <- encJSON:
-			log.Printf("[webhook] forwarded encrypted payload to tunnel %s (%d bytes)", tunnelID, len(body))
+			logger.Info("forwarded encrypted payload", "tunnel_id", tunnelID, "bytes", len(body))
 		default:
-			log.Printf("[webhook] send buffer full for tunnel %s, dropping payload", tunnelID)
+			logger.Warn("send buffer full, dropping payload", "tunnel_id", tunnelID)
 			http.Error(w, `{"error":"tunnel send buffer full"}`, http.StatusServiceUnavailable)
 			return
 		}
