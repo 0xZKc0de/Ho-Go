@@ -125,10 +125,11 @@ func HandleWebhook(hub *Hub) http.HandlerFunc {
 			return
 		}
 
-		// Read the webhook body.
+		// Read the webhook body with a 10MB limit.
+		r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			http.Error(w, `{"error":"failed to read body"}`, http.StatusInternalServerError)
+			http.Error(w, `{"error":"payload too large or failed to read body"}`, http.StatusRequestEntityTooLarge)
 			return
 		}
 		defer r.Body.Close()

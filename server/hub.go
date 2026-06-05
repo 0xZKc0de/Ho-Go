@@ -9,8 +9,21 @@ import (
 	"encoding/hex"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
+)
+
+const (
+	// maxMessageSize is the maximum allowed WebSocket message size (10 MB).
+	maxMessageSize = 10 << 20
+
+	// pongWait is the maximum time to wait for a pong response from the client.
+	pongWait = 60 * time.Second
+
+	// pingPeriod is the interval at which pings are sent to the client.
+	// Must be less than pongWait.
+	pingPeriod = (pongWait * 9) / 10
 )
 
 // TunnelClient represents a connected client with an active tunnel.
@@ -43,7 +56,7 @@ func (h *Hub) Register(client *TunnelClient) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.clients[client.ID] = client
-	log.Printf("[hub] registered tunnel: %s", client.ID)
+	log.Printf("[hub] registered tunnel: %s (active: %d)", client.ID, len(h.clients))
 }
 
 // Unregister removes a tunnel client from the hub and closes its
@@ -60,7 +73,7 @@ func (h *Hub) Unregister(tunnelID string) {
 	close(client.Send)
 	client.Conn.Close()
 	delete(h.clients, tunnelID)
-	log.Printf("[hub] unregistered tunnel: %s", tunnelID)
+	log.Printf("[hub] unregistered tunnel: %s (active: %d)", tunnelID, len(h.clients))
 }
 
 // GetClient returns the TunnelClient for the given tunnel ID,
@@ -82,24 +95,49 @@ func GenerateTunnelID() (string, error) {
 }
 
 // WritePump reads messages from the client's send channel and writes
-// them to the WebSocket connection. It runs as a goroutine and exits
-// when the send channel is closed.
+// them to the WebSocket connection. It also sends periodic pings to
+// detect dead connections. Runs as a goroutine; exits when the send
+// channel is closed.
 func (c *TunnelClient) WritePump() {
-	defer c.Conn.Close()
+	ticker := time.NewTicker(pingPeriod)
+	defer func() {
+		ticker.Stop()
+		c.Conn.Close()
+	}()
 
-	for msg := range c.Send {
-		if err := c.Conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-			log.Printf("[hub] write error for tunnel %s: %v", c.ID, err)
-			return
+	for {
+		select {
+		case msg, ok := <-c.Send:
+			if !ok {
+				// Send channel closed — write a close frame.
+				c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			if err := c.Conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				log.Printf("[hub] write error for tunnel %s: %v", c.ID, err)
+				return
+			}
+		case <-ticker.C:
+			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				log.Printf("[hub] ping error for tunnel %s: %v", c.ID, err)
+				return
+			}
 		}
 	}
 }
 
 // ReadPump reads messages from the WebSocket connection and discards them.
-// It detects client disconnections and triggers cleanup via the hub.
-// It runs as a goroutine.
+// It enforces a read size limit and pong deadline to detect dead connections.
+// Runs as a goroutine; triggers tunnel cleanup on exit.
 func (c *TunnelClient) ReadPump(hub *Hub) {
 	defer hub.Unregister(c.ID)
+
+	c.Conn.SetReadLimit(maxMessageSize)
+	c.Conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.Conn.SetPongHandler(func(string) error {
+		c.Conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
 
 	for {
 		if _, _, err := c.Conn.ReadMessage(); err != nil {

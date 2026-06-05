@@ -74,20 +74,24 @@ The server **never** has access to the private key — it can only encrypt, neve
 
 ## Quick Start
 
+⚠️ **IMPORTANT**: You must run the server, client, and curl command in **three separate terminal windows** at the same time. The tunnel only exists while the client is connected!
+
 ### 1. Install dependencies
 
 ```bash
 go mod tidy
 ```
 
-### 2. Start the server
+### 2. Start the server (Terminal 1)
 
+Keep this running!
 ```bash
 go run ./cmd/server -addr :8080 -base-url http://localhost:8080
 ```
 
-### 3. Start the client (in another terminal)
+### 3. Start the client (Terminal 2)
 
+Keep this running! It will connect to the server.
 ```bash
 go run ./cmd/client -server ws://localhost:8080/ws -forward http://localhost:3000
 ```
@@ -107,8 +111,9 @@ The client will display:
 ╚══════════════════════════════════════════════════════════════╝
 ```
 
-### 4. Send a test webhook
+### 4. Send a test webhook (Terminal 3)
 
+Copy the `Tunnel ID` from Terminal 2 and replace `<your-tunnel-id>` below:
 ```bash
 curl -X POST \
   -H "Content-Type: application/json" \

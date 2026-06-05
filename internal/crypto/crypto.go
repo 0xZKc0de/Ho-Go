@@ -102,6 +102,12 @@ func EncryptPayload(publicKey *rsa.PublicKey, plaintext []byte) (*models.Encrypt
 
 	// Step 3: Encrypt the AES key with RSA-OAEP.
 	encryptedKey, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, publicKey, aesKey, nil)
+	
+	// Zero out the AES key from memory now that it is encrypted and used.
+	for i := range aesKey {
+		aesKey[i] = 0
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("RSA encrypt AES key: %w", err)
 	}
